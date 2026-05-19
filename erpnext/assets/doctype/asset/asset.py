@@ -5,7 +5,7 @@
 import frappe, erpnext, math, json
 from frappe import _
 from six import string_types
-from frappe.utils import flt, add_months, cint, nowdate, getdate, today, date_diff, month_diff, add_days, get_datetime, get_link_to_form
+from frappe.utils import flt, add_months, cint, nowdate, getdate, today, date_diff, month_diff, add_days, get_datetime, get_link_to_form, get_last_day
 from erpnext.assets.doctype.asset_category.asset_category import get_asset_category_account
 from erpnext.assets.doctype.asset.depreciation \
 	import get_disposal_account_and_cost_center, get_depreciation_accounts
@@ -264,7 +264,25 @@ class Asset(AccountsController):
 
 			has_pro_rata = self.check_is_pro_rata(d)
 
-			if has_pro_rata:
+			month_end = cint(d.schedule_based_on_month_end)
+			start_on_month_end = False
+			if month_end:
+				# When scheduling on month-end, the first period is always pro-rated
+				# and an extra balancing row is added at the end so the schedule still
+				# reconciles with the full depreciable amount. If the start date is
+				# itself a month-end, only a single day of depreciation is charged for
+				# the first period; otherwise the partial first period (start date ->
+				# month-end of the start month) is pro-rated for the actual days.
+				start_on_month_end = (getdate(d.depreciation_start_date)
+					== getdate(get_last_day(d.depreciation_start_date)))
+				has_pro_rata = True
+
+			# Outside month-end mode, a partial first period needs an extra balancing
+			# row at the end (stock behaviour). In month-end mode the total entry
+			# count must always equal total_number_of_depreciations regardless of
+			# whether the start date is a month-end, so the partial first period and
+			# the balancing last row fit within the total (e.g. 48 stays 48).
+			if has_pro_rata and not month_end:
 				number_of_pending_depreciations += 1
 
 			skip_row = False
@@ -279,14 +297,37 @@ class Asset(AccountsController):
 					schedule_date = add_months(d.depreciation_start_date,
 						n * cint(d.frequency_of_depreciation))
 
+					# When scheduling on month-end, post on the last day of the month
+					if month_end:
+						schedule_date = get_last_day(schedule_date)
+
 					# schedule date will be a year later from start date
 					# so monthly schedule date is calculated by removing 11 months from it
 					monthly_schedule_date = add_months(schedule_date, - d.frequency_of_depreciation + 1)
 
 				# For first row
 				if has_pro_rata and n==0:
-					depreciation_amount, days, months = get_pro_rata_amt(d, depreciation_amount,
-						self.available_for_use_date, d.depreciation_start_date)
+					if month_end:
+						if start_on_month_end:
+							# Start date is itself a month-end: charge only one day of
+							# depreciation for the first period, on a 365-day basis.
+							annual_depreciation_amount = (depreciation_amount
+								* (12.0 / cint(d.frequency_of_depreciation)))
+							depreciation_amount = flt(annual_depreciation_amount / 365.0,
+								self.precision("gross_purchase_amount"))
+							days = 1
+							months = cint(d.frequency_of_depreciation)
+							schedule_date = get_last_day(d.depreciation_start_date)
+						else:
+							# First (partial) period: from the start date to the month-end
+							# of the start month, pro-rated for the actual days.
+							first_period_end = get_last_day(d.depreciation_start_date)
+							depreciation_amount, days, months = get_pro_rata_amt(d, depreciation_amount,
+								d.depreciation_start_date, first_period_end)
+							schedule_date = first_period_end
+					else:
+						depreciation_amount, days, months = get_pro_rata_amt(d, depreciation_amount,
+							self.available_for_use_date, d.depreciation_start_date)
 
 					# For first depr schedule date will be the start date
 					# so monthly schedule date is calculated by removing month difference between use date and start date
@@ -294,16 +335,31 @@ class Asset(AccountsController):
 
 				# For last row
 				elif has_pro_rata and n == cint(number_of_pending_depreciations) - 1:
-					to_date = add_months(self.available_for_use_date,
-						n * cint(d.frequency_of_depreciation))
+					if month_end:
+						# Final balancing row: post on the month-end and depreciate
+						# whatever value is left so the schedule reconciles exactly
+						# (the complement of the partial first period).
+						schedule_date = get_last_day(add_months(d.depreciation_start_date,
+							n * cint(d.frequency_of_depreciation)))
+						depreciation_amount = flt(value_after_depreciation
+							- flt(d.expected_value_after_useful_life),
+							self.precision("gross_purchase_amount"))
+						days = get_total_days(schedule_date, d.frequency_of_depreciation)
+						months = cint(d.frequency_of_depreciation)
+						monthly_schedule_date = add_months(schedule_date,
+							- d.frequency_of_depreciation + 1)
+						last_schedule_date = schedule_date
+					else:
+						to_date = add_months(self.available_for_use_date,
+							n * cint(d.frequency_of_depreciation))
 
-					depreciation_amount, days, months = get_pro_rata_amt(d,
-						depreciation_amount, schedule_date, to_date)
+						depreciation_amount, days, months = get_pro_rata_amt(d,
+							depreciation_amount, schedule_date, to_date)
 
-					monthly_schedule_date = add_months(schedule_date, 1)
+						monthly_schedule_date = add_months(schedule_date, 1)
 
-					schedule_date = add_days(schedule_date, days)
-					last_schedule_date = schedule_date
+						schedule_date = add_days(schedule_date, days)
+						last_schedule_date = schedule_date
 
 				if not depreciation_amount: continue
 				value_after_depreciation -= flt(depreciation_amount,
@@ -318,7 +374,7 @@ class Asset(AccountsController):
 
 				if depreciation_amount > 0:
 					# With monthly depreciation, each depreciation is divided by months remaining until next date
-					if self.allow_monthly_depreciation:
+					if self.allow_monthly_depreciation and not (month_end and start_on_month_end and n == 0):
 						# month range is 1 to 12
 						# In pro rata case, for first and last depreciation, month range would be different
 						month_range = months \
@@ -347,7 +403,7 @@ class Asset(AccountsController):
 								amount = depreciation_amount / month_range
 
 							self.append("schedules", {
-								"schedule_date": date,
+								"schedule_date": get_last_day(date) if d.schedule_based_on_month_end else date,
 								"depreciation_amount": amount,
 								"depreciation_method": d.depreciation_method,
 								"finance_book": d.finance_book,
@@ -355,7 +411,7 @@ class Asset(AccountsController):
 							})
 					else:
 						self.append("schedules", {
-							"schedule_date": schedule_date,
+							"schedule_date": get_last_day(schedule_date) if d.schedule_based_on_month_end else schedule_date,
 							"depreciation_amount": depreciation_amount,
 							"depreciation_method": d.depreciation_method,
 							"finance_book": d.finance_book,
